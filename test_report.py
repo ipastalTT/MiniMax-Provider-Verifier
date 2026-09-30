@@ -187,6 +187,7 @@ class TestResult:
     message: str = ""
     feature: str = ""
     waived: bool = False
+    details: str = ""  # full pytest failure text (traceback + assertion)
 
     @property
     def is_failure(self) -> bool:
@@ -292,11 +293,12 @@ def parse_junit(path: Path, name: str) -> SuiteResult:
     for ts in root.iter("testsuite"):
         suite.duration = max(suite.duration, float(ts.get("time", 0) or 0))
         for tc in ts.iter("testcase"):
-            outcome, message = "passed", ""
+            outcome, message, details = "passed", "", ""
             for tag in ("failure", "error", "skipped"):
                 node = tc.find(tag)
                 if node is not None:
                     outcome = {"failure": "failed"}.get(tag, tag)
+                    details = node.text or ""
                     if tag == "skipped" and node.get("type") == "pytest.xfail":
                         outcome = "xfailed"
                     message = node.get("message") or (node.text or "")
@@ -308,7 +310,8 @@ def parse_junit(path: Path, name: str) -> SuiteResult:
                 lines = message.strip().splitlines()
                 suite.collection_error = lines[-1] if lines else "collection error"
                 continue
-            suite.tests.append(TestResult(name, tc.get("classname", ""), tc.get("name", "?"), outcome, message))
+            suite.tests.append(TestResult(name, tc.get("classname", ""), tc.get("name", "?"), outcome, message,
+                                          details=details))
     return suite
 
 
@@ -941,6 +944,8 @@ def render(meta: dict, suites: list[SuiteResult], summary: dict) -> str:
         "",
         "---",
         "",
+        f"Full failure messages and tracebacks for every test: `verifier_results_{meta['report_id']}.json`.",
+        "",
         "Note: pass rates exclude skipped and xfailed tests (xfail marks a known, expected failure and does not "
         "fail acceptance; an unexpected pass of an xfail test counts as passed). Totals exclude suites that are "
         "not graded for this model. Failures attributed to a feature declared unsupported are waived: they are "
@@ -952,6 +957,110 @@ def render(meta: dict, suites: list[SuiteResult], summary: dict) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def build_json_report(meta: dict, suites: list[SuiteResult], summary: dict, markdown: str) -> dict:
+    """Machine-readable report in the shape of tt-inference-server's report JSON
+    (metadata / sections / acceptance_*), with every test's full failure message.
+
+    Deliberately NOT named report_*.json: the exabox merger ingests those and
+    this verifier is report-only.
+    """
+    sections = []
+    categories = []
+    blockers: dict[str, str] = {}
+    for s in suites:
+        results = []
+        suite_blockers: dict[str, str] = {}
+        suite_waived: dict[str, str] = {}
+        for t in s.tests:
+            entry = {"test": t.name, "classname": t.classname, "outcome": t.outcome}
+            if t.outcome != "passed":
+                entry["message"] = t.message
+                if t.details and t.details != t.message:
+                    entry["details"] = t.details
+            if t.is_failure:
+                cause = classify(t.message)
+                entry.update(feature=t.feature, cause=cause, waived=t.waived)
+                key = f"{s.name}:{t.name}"
+                if t.waived:
+                    suite_waived[key] = f"{cause} (unsupported: {t.feature})"
+                elif not s.graded:
+                    suite_waived[key] = f"{cause} (not graded)"
+                else:
+                    suite_blockers[key] = cause
+            results.append(entry)
+        if s.collection_error:
+            suite_blockers[f"{s.name}:collection"] = s.collection_error
+        if s.graded:
+            blockers.update(suite_blockers)
+        data = {
+            "suite": s.name,
+            "description": SUITES.get(s.name, ("", ""))[1],
+            "graded": s.graded,
+            "status": s.status,
+            "passed": s.count("passed"),
+            "failed": s.count("failed"),
+            "errors": s.count("error"),
+            "skipped": s.count("skipped"),
+            "xfailed": s.count("xfailed"),
+            "waived": s.waived,
+            "pass_rate": s.pass_rate,
+            "pass_rate_excl_unsupported": s.pass_rate_excl_unsupported,
+            "duration_s": round(s.duration, 1),
+            "collection_error": s.collection_error or None,
+        }
+        section = {
+            "kind": "vendor_verifier",
+            "title": f"Pytest Verifier — {s.name}" if s.name != "verify" else "Tool-Call Metrics — verify.py",
+            "task_type": "api_contract",
+            "id": s.name,
+            "data": data,
+            "results": results,
+        }
+        if s.verify:
+            section["verify"] = s.verify
+        sections.append(section)
+        categories.append({
+            "name": s.name,
+            "status": s.status,
+            "total": s.executed,
+            "passed": s.count("passed"),
+            "failed": s.count("failed") + s.count("error"),
+            "na": s.count("skipped") if s.name == "verify" else 0,
+            "skipped": s.count("skipped") + s.count("xfailed"),
+            "blockers": suite_blockers if s.graded else {},
+            "waived": {**suite_waived, **({} if s.graded else suite_blockers)},
+        })
+
+    acceptance_md = markdown.split("### Acceptance Criteria", 1)[-1].split("\n---\n", 1)[0]
+    return {
+        "metadata": {
+            "model_name": meta["model"].split("/")[-1],
+            "model_repo": meta["model"],
+            "provider": meta["provider"],
+            "generated_at": meta["generated_at"],
+            "report_id": meta["report_id"],
+            "workflow": "vendor_verifier",
+            "verifier": "minimax-provider-verifier",
+            "report_partial": any(s.collection_error for s in suites),
+            "report_blocks": len(sections),
+            "server_mode": "API",
+            **{k: v for k, v in meta.items() if k not in ("model", "provider", "generated_at", "report_id")},
+        },
+        "sections": sections,
+        "acceptance_criteria": summary["status"] == "PASS",
+        "acceptance_blockers": blockers,
+        "acceptance_criteria_metadata": {
+            "enforcement_result": summary["status"],
+            "pass_rate": summary["pass_rate"],
+            "pass_rate_excl_unsupported": summary["pass_rate_excl_unsupported"],
+            "unsupported_features": meta["unsupported"],
+            "failures_by_feature": summary["failures_by_feature"],
+            "categories": categories,
+        },
+        "acceptance_summary_markdown": "### Acceptance Criteria" + acceptance_md.rstrip(),
+    }
 
 
 def main() -> int:
@@ -1079,10 +1188,15 @@ def main() -> int:
     report_meta = {k: v for k, v in meta.items() if k != "runs"}
     summary = summarize(report_meta, suites)
     report_path = out_dir / f"report_{meta['report_id']}.md"
-    report_path.write_text(render(report_meta, suites, summary))
+    markdown = render(report_meta, suites, summary)
+    report_path.write_text(markdown)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
-    redact_dir(out_dir, secrets, [report_path, out_dir / "summary.json"])
+    json_path = out_dir / f"verifier_results_{meta['report_id']}.json"
+    json_path.write_text(json.dumps(build_json_report(report_meta, suites, summary, markdown),
+                                    indent=4, ensure_ascii=False) + "\n")
+    redact_dir(out_dir, secrets, [report_path, out_dir / "summary.json", json_path])
     print(f"[report] {report_path}")
+    print(f"[json] {json_path}")
     print(f"[summary] {out_dir / 'summary.json'}")
     print(f"[status] {summary['status']} pass_rate={pct(summary['pass_rate'])} "
           f"excl_unsupported={pct(summary['pass_rate_excl_unsupported'])}")
