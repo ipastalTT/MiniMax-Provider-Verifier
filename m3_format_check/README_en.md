@@ -48,7 +48,7 @@ export M3_API_KEY="sk-xxx"
 |------|------|------|
 | `M3_MODEL` | `MiniMax-M3` | Primary model ID |
 | `M3_MODEL_MINI` | `MiniMax-M2-mini` | Mini model ID (used by the model-name compatibility case; if no such model is registered on the endpoint, that case is xfailed) |
-| `M3_RUN_LOG` | `logs/run_<UTC-ts>.jsonl` | Override the jsonl output path |
+| `M3_RUN_LOG` | `logs/run_<UTC-ts>.jsonl` | Override the jsonl output path (under pytest-xdist each worker appends a `_<workerid>` suffix) |
 | `M3_EXTRA_HEADERS` | (empty) | JSON string of extra request headers to inject, e.g. `'{"X-Custom-Header": "value"}'` |
 | `M3_SKIP_REASONING_SPLIT` | `0` | Set to `1` to skip cases that depend on `reasoning_split` (some implementations do not pass through this OAI extension) |
 | `M3_LONG_VIDEO_DIR` | `fixtures/m3_test_videos` | Long-video (D_*s.mp4) directory. Defaults to the in-repo fixtures; override to point at a different set. |

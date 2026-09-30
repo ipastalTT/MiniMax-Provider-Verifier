@@ -205,6 +205,26 @@ bash run_batch_sequential.sh \
 - `comparison_report.json`: 与基准模型的对比结果
 - 各循环的单独结果位于 `loop_01/`、`loop_02/` 等目录
 
+### 并行测试与报告（`run_verifier.sh`）
+
+`run_verifier.sh` 并行运行 `m3_format_check/` 中的 pytest 格式校验套件（`text`、`image`、`video`、`stream`、`reasoning_effort`）以及一次 `sample.jsonl` 上的 `verify.py`（`verify`），然后通过 `test_report.py` 生成 Markdown 通过率报告。可在任意目录调用（例如在其他仓库的 CI 中）：
+
+```bash
+MINIMAX_API_KEY=sk-... \
+MINIMAX_BASE_URL=https://api.example.com/v1 \
+MODEL_NAME=MiniMaxAI/MiniMax-M3 \
+PROVIDER=Tenstorrent UNSUPPORTED="video" \
+/path/to/MiniMax-Provider-Verifier/run_verifier.sh
+```
+
+- 配置均为环境变量（未设置的从 `<repo>/.env` 读取）：`MINIMAX_API_KEY`（回退到 `OPENAI_API_KEY`）、`MINIMAX_BASE_URL`（OpenAI 兼容地址，包含 `/v1`；pytest 套件使用去掉 `/v1` 的地址）、`MODEL_NAME`、`PROVIDER`、`UNSUPPORTED`、`SUITES`、`TEXT_WORKERS` / `IMAGE_WORKERS` / `VIDEO_WORKERS` / `STREAM_WORKERS` / `REASONING_EFFORT_WORKERS`（pytest-xdist worker 数，默认 16）、`VERIFY_CONCURRENCY`（默认 16）、`VERIFY_LIMIT`（只跑前 N 个样本）、`INCLUDE_SLOW=1`（同时运行 `slow` 用例）、`M3_EXTRA_HEADERS`、`REPORT_DIR`（默认 `<repo>/reports`）。额外参数会传给 `test_report.py`，例如 `--pytest-args="-k TestSSEStream"`。
+- 未设置 API key 时按无鉴权方式测试（`M3_AUTH_TYPE=none`），两个 401 用例会被豁免。
+- 依赖由 `uv` 根据 `requirements.txt` 和 `m3_format_check/requirements.txt` 从 PyPI 安装到缓存环境（可用 `UV_DEFAULT_INDEX` 覆盖）。不使用 `pyproject.toml` / `uv.lock`，因为它们固定了镜像源，且不包含 pytest 依赖。
+- 每次运行生成 `REPORT_DIR/<provider>_<model>_<timestamp>/`，包含 `report_<id>.md`、`summary.json`、`run_meta.json`，每个 pytest 套件一份 JUnit XML 和控制台日志，`verify_results.jsonl` / `verify_summary.json` / `verify.log`，以及 `logs/` 下的逐请求日志。目录内所有文件都会脱敏 API key。
+- 报告包含各套件通过率、按原因和按 API 功能归类的失败，以及 Tool-Call Metrics 表：按上文参考阈值评判 `verify.py` 指标，每个指标计为一项评分检查。ToolCalls-Trigger-Similarity 与 `output-dir/<model>/` 中第一轮官方结果对比。`reasoning_effort` 属于 M3-a / M3.1 套件，其他模型显示为 NOT GRADED。
+- 不调用 API 重新生成报告：`python test_report.py --render-only REPORT_DIR/<run>`。评判已有的 `verify.py` 输出：`--suites verify --verify-results path/to/results.jsonl`。
+- 退出码：`0` 验收通过，`1` 未通过，`2` 配置错误。
+
 ## 后续计划
 
 - [ ] 扩展和完善评估集。

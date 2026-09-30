@@ -11,7 +11,8 @@ Optional env vars:
   M3_MODEL_MINI — Mini model ID (default: MiniMax-M2-mini)
   M3_RUN_LOG    — Override the per-run jsonl path. Default is
                   ./logs/run_<UTC-ts>.jsonl (or run_<UTC-ts>_<workerid>.jsonl
-                  per worker when running under pytest-xdist).
+                  per worker when running under pytest-xdist). Under xdist an
+                  override also gets a _<workerid> suffix per worker.
 
 Concurrency:
   Serial (default):
@@ -52,10 +53,14 @@ def _resolve_log_path(config) -> Path:
     every process writes to its own file (no cross-process interleaving).
     """
     override = os.environ.get("M3_RUN_LOG")
-    if override:
-        return Path(override).expanduser().resolve()
-
     workerinput = getattr(config, "workerinput", None)
+    if override:
+        path = Path(override).expanduser().resolve()
+        if workerinput is not None:
+            # One file per xdist worker, so multi-MB records never interleave.
+            path = path.with_name(f"{path.stem}_{workerinput['workerid']}{path.suffix}")
+        return path
+
     if workerinput is not None:
         # xdist worker: timestamp comes from the controller via workerinput.
         ts = workerinput["m3_run_ts"]

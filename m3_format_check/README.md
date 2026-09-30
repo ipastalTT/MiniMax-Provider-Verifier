@@ -47,7 +47,7 @@ export M3_API_KEY="sk-xxx"
 |------|------|------|
 | `M3_MODEL` | `MiniMax-M3` | 主模型 ID |
 | `M3_MODEL_MINI` | `MiniMax-M2-mini` | mini 模型(模型名兼容 case 用;若 endpoint 未注册同名模型该 case 会 xfail) |
-| `M3_RUN_LOG` | `logs/run_<UTC-ts>.jsonl` | 自定义 jsonl 路径 |
+| `M3_RUN_LOG` | `logs/run_<UTC-ts>.jsonl` | 自定义 jsonl 路径（pytest-xdist 下每个 worker 追加 `_<workerid>` 后缀） |
 | `M3_EXTRA_HEADERS` | (空) | JSON 串,额外注入请求头,例如 `'{"X-Custom-Header": "value"}'` |
 | `M3_SKIP_REASONING_SPLIT` | `0` | `1` 时跳过依赖 `reasoning_split` 的 case(部分实现不放行该 OAI extension) |
 | `M3_LONG_VIDEO_DIR` | `fixtures/m3_test_videos` | 长视频(D_*s.mp4)目录,默认走仓内 fixtures;需要换一组时改这里 |
