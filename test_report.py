@@ -619,6 +619,82 @@ def redacted_cmd(cmd: list[str], secrets: list[str]) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Live progress
+# ---------------------------------------------------------------------------
+
+# Seconds between [progress] lines while suites run (0 disables).
+PROGRESS_INTERVAL = float(os.environ.get("VERIFIER_PROGRESS_INTERVAL", "60"))
+# A pytest -q progress line: one character per finished case (R = rerun), then [ NN%].
+_PYTEST_PROGRESS = re.compile(r"^([.FEsxXR]+)\s*(?:\[\s*(\d+)%\])?$")
+
+
+def format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{secs:02d}s"
+
+
+def suite_progress(suite: str, log_path: Path) -> str:
+    """One-line progress for a running suite, read from its log."""
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError:
+        return "starting"
+    if suite == "verify":
+        runs = re.findall(r"=== verify\.py run (\d+)/(\d+)", text)
+        bars = re.findall(r"Processing:\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)", text)
+        if not bars:
+            return "starting"
+        done, total = int(bars[-1][0]), int(bars[-1][1])
+        run, runs_total = (int(runs[-1][0]), int(runs[-1][1])) if runs else (1, 1)
+        pct = 100 * ((run - 1) * total + done) // (runs_total * total) if total else 0
+        where = f"pass {run}/{runs_total}, " if runs_total > 1 else ""
+        return f"{pct}% done ({where}{done}/{total} cases)"
+    done = failed = 0
+    pct = None
+    for line in text.splitlines():
+        if line.startswith("=="):
+            break  # FAILURES / short summary: progress lines all come before
+        m = _PYTEST_PROGRESS.match(line.strip())
+        if not m:
+            continue
+        done += sum(m.group(1).count(c) for c in ".FEsxX")
+        failed += m.group(1).count("F") + m.group(1).count("E")
+        if m.group(2):
+            pct = int(m.group(2))
+    if not done:
+        return "0% done (collecting / starting workers)"
+    return (f"{pct}% done" if pct is not None else "running") + f" ({done} cases, {failed} failed so far)"
+
+
+def wait_with_progress(procs: dict, out_dir: Path, on_done) -> None:
+    """Wait for {suite: (popen, ...)} to finish, printing [progress] lines meanwhile.
+
+    on_done(suite, exit_code, elapsed_seconds) is called as each one finishes.
+    """
+    import time
+
+    start = time.monotonic()
+    next_report = start + PROGRESS_INTERVAL
+    pending = dict(procs)
+    while pending:
+        for suite, entry in list(pending.items()):
+            code = entry[0].poll()
+            if code is not None:
+                del pending[suite]
+                on_done(suite, code, time.monotonic() - start)
+        if pending and PROGRESS_INTERVAL > 0 and time.monotonic() >= next_report:
+            elapsed = format_duration(time.monotonic() - start)
+            for suite in pending:
+                print(f"[progress] {suite}: {suite_progress(suite, out_dir / f'{suite}.log')} · {elapsed} elapsed",
+                      flush=True)
+            next_report += PROGRESS_INTERVAL
+        if pending:
+            time.sleep(1)
+
+
 def run_suites(args: argparse.Namespace, meta: dict, out_dir: Path, workers: dict[str, int],
                api_key: str, secrets: list[str]) -> dict[str, dict]:
     log_dir = out_dir / "logs"
@@ -690,13 +766,16 @@ def run_suites(args: argparse.Namespace, meta: dict, out_dir: Path, workers: dic
             shown = redacted_cmd(cmd[1:] if cmd[0] == sys.executable else cmd, secrets)
             print(f"[run] {suite} (workers={workers[suite]}): {shown}", flush=True)
             proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
-            procs[suite] = (shown, proc, log, time.monotonic())
-        for suite, (shown, proc, log, start) in procs.items():
-            code = proc.wait()
+            procs[suite] = (proc, shown, log)
+
+        def on_done(suite: str, code: int, elapsed: float, procs=procs) -> None:
+            _proc, shown, log = procs[suite]
             log.close()
-            elapsed = round(time.monotonic() - start, 1)
-            print(f"[done] {suite}: exit code {code} after {elapsed:.0f}s", flush=True)
-            runs[suite] = {"exit_code": code, "workers": workers[suite], "wall_seconds": elapsed, "command": shown}
+            print(f"[done] {suite}: exit code {code} after {format_duration(elapsed)}", flush=True)
+            runs[suite] = {"exit_code": code, "workers": workers[suite], "wall_seconds": round(elapsed, 1),
+                           "command": shown}
+
+        wait_with_progress(procs, out_dir, on_done)
     return runs
 
 
