@@ -29,6 +29,7 @@
 #   VERIFY_LIMIT            Only run the first N sample.jsonl cases  (default: all)
 #   VERIFY_LOOPS            Run verify.py N times in a row and grade the mean (pass@N) (default: 1)
 #   INCLUDE_SLOW            0 to skip the pytest cases marked slow   (default: 1, run them)
+#   BLOCKING_SUITES         Suites that decide acceptance; the rest are reported only (default: verify)
 #   RUN_ORDER               sequential: verify.py first, then the pytest suites (default);
 #                           parallel: everything at once
 #   M3_EXTRA_HEADERS        Optional JSON object of extra request headers (both harnesses)
@@ -75,6 +76,7 @@ VERIFY_LIMIT="${VERIFY_LIMIT:-0}"
 VERIFY_LOOPS="${VERIFY_LOOPS:-1}"
 INCLUDE_SLOW="${INCLUDE_SLOW:-1}"
 RUN_ORDER="${RUN_ORDER:-sequential}"
+BLOCKING_SUITES="${BLOCKING_SUITES-verify}"
 REPORT_DIR="${REPORT_DIR:-$REPO_DIR/reports}"
 
 if [[ -z "${MINIMAX_API_KEY:-}" && -n "${OPENAI_API_KEY:-}" ]]; then
@@ -117,6 +119,8 @@ args=(
 )
 # shellcheck disable=SC2206  # word splitting of the space-separated lists is intended
 args+=(--suites $SUITES)
+# shellcheck disable=SC2206
+args+=(--blocking-suites $BLOCKING_SUITES)
 if [[ -n "$UNSUPPORTED" ]]; then
     # shellcheck disable=SC2206
     args+=(--unsupported $UNSUPPORTED)

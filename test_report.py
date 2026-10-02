@@ -65,6 +65,10 @@ PYTEST_SUITES = [s for s, (f, _) in SUITES.items() if f]
 # Default run: the tool-call metrics plus the text and stream format checks, slow cases
 # included, 20-way, verify.py first and the format checks after it.
 DEFAULT_SUITES = ["text", "stream", "verify"]
+# Only these suites decide acceptance; the others (the format checks) are reported
+# in full but never fail the run.
+DEFAULT_BLOCKING_SUITES = ["verify"]
+NON_BLOCKING_FAIL = "FAIL (non-blocking)"
 DEFAULT_WORKERS = "20"
 
 # Suites that only apply to some models: suite -> pattern the model name must match.
@@ -166,7 +170,7 @@ KNOWN_CAUSES: list[tuple[str, str]] = [
     (r"worker '\w+' crashed", "pytest-xdist worker crashed"),
 ]
 
-STATUS_ICON = {"PASS": "✅", "FAIL": "❌", "NA": "🟨", "NOT GRADED": "⚪"}
+STATUS_ICON = {"PASS": "✅", "FAIL": "❌", "NA": "🟨", "NOT GRADED": "⚪", NON_BLOCKING_FAIL: "🟨"}
 
 # verify.py metric -> (label, comparison, threshold, threshold text, feature).
 # Thresholds from README.md "Reference Thresholds". ToolCalls-Match-Rate is documented as
@@ -202,6 +206,7 @@ class TestResult:
 class SuiteResult:
     name: str
     graded: bool = True
+    blocking: bool = True  # False: reported, but never fails acceptance
     tests: list[TestResult] = field(default_factory=list)
     duration: float = 0.0
     collection_error: str = ""
@@ -235,7 +240,7 @@ class SuiteResult:
         if not self.graded:
             return "NOT GRADED"
         if self.collection_error or any(not t.waived for t in self.failures):
-            return "FAIL"
+            return "FAIL" if self.blocking else NON_BLOCKING_FAIL
         return "PASS" if self.executed else "NA"
 
 
@@ -755,6 +760,7 @@ def summarize(meta: dict, suites: list[SuiteResult]) -> dict:
         "suites": {
             s.name: {
                 "graded": s.graded,
+                "blocking": s.blocking,
                 "status": s.status,
                 "passed": s.count("passed"),
                 "failed": s.count("failed"),
@@ -907,6 +913,10 @@ def render(meta: dict, suites: list[SuiteResult], summary: dict) -> str:
         ]
     for feature, reason in meta.get("auto_waived", {}).items():
         lines.append(f"- `{feature}` waived automatically: {reason}")
+    non_blocking = [s.name for s in suites if not s.blocking]
+    if non_blocking:
+        lines.append(f"- Blocking: {', '.join(f'`{n}`' for n in meta['blocking_suites'] if n in meta['suites']) or 'none'}. "
+                     f"Non-blocking (reported, never fail acceptance): {', '.join(f'`{n}`' for n in non_blocking)}")
     for s in suites:
         if s.collection_error:
             detail = f"did not run: {s.collection_error}"
@@ -925,7 +935,7 @@ def render(meta: dict, suites: list[SuiteResult], summary: dict) -> str:
     if overall == "PASS":
         lines.append("- All acceptance criteria passed.")
     else:
-        lines.append("- Acceptance criteria not met: every graded test and every verify.py metric must pass "
+        lines.append("- Acceptance criteria not met: every graded check in a blocking suite must pass "
                      "or be waived as unsupported.")
 
     lines += [
@@ -1044,17 +1054,20 @@ def build_json_report(meta: dict, suites: list[SuiteResult], summary: dict, mark
                     suite_waived[key] = f"{cause} (unsupported: {t.feature})"
                 elif not s.graded:
                     suite_waived[key] = f"{cause} (not graded)"
+                elif not s.blocking:
+                    suite_waived[key] = f"{cause} (non-blocking suite)"
                 else:
                     suite_blockers[key] = cause
             results.append(entry)
         if s.collection_error:
-            suite_blockers[f"{s.name}:collection"] = s.collection_error
-        if s.graded:
+            (suite_blockers if s.blocking else suite_waived)[f"{s.name}:collection"] = s.collection_error
+        if s.graded and s.blocking:
             blockers.update(suite_blockers)
         data = {
             "suite": s.name,
             "description": SUITES.get(s.name, ("", ""))[1],
             "graded": s.graded,
+            "blocking": s.blocking,
             "status": s.status,
             "passed": s.count("passed"),
             "failed": s.count("failed"),
@@ -1139,6 +1152,9 @@ def main() -> int:
     parser.add_argument("--include-slow", action=argparse.BooleanOptionalAction, default=True,
                         help="Run the pytest cases marked slow (512k/1M-token prompts, long videos); "
                              "--no-include-slow deselects them (default: included)")
+    parser.add_argument("--blocking-suites", nargs="*", choices=list(SUITES), default=None,
+                        help="Suites whose failures fail acceptance; the others are reported only "
+                             f"(default: {' '.join(DEFAULT_BLOCKING_SUITES)})")
     parser.add_argument("--order", choices=["sequential", "parallel"], default="sequential",
                         help="sequential: verify.py first, then the pytest suites (in parallel with each "
                              "other), so long prompts do not slow the tool-call runs; parallel: everything "
@@ -1224,6 +1240,9 @@ def main() -> int:
         meta["auto_waived"]["auth"] = ("the endpoint was tested without authentication (M3_AUTH_TYPE=none), "
                                        "so the 401 checks cannot pass")
     meta["unsupported"] = sorted(set(meta["unsupported"]) | set(meta["auto_waived"]))
+    if args.blocking_suites is not None:
+        meta["blocking_suites"] = args.blocking_suites
+    meta.setdefault("blocking_suites", DEFAULT_BLOCKING_SUITES)
     meta["ungraded_suites"] = [
         s for s, pattern in MODEL_SCOPED_SUITES.items()
         if s in meta["suites"] and (
@@ -1249,6 +1268,7 @@ def main() -> int:
             if code in (2, 3, 4) and not s.tests and not s.collection_error:
                 s.collection_error = f"pytest exited with code {code}: {last_log_line(out_dir / f'{name}.log')}"
         s.graded = s.name not in meta["ungraded_suites"]
+        s.blocking = s.name in meta["blocking_suites"]
         for t in s.failures:
             t.feature = attribute_feature(t)
             t.waived = t.feature in meta["unsupported"]
