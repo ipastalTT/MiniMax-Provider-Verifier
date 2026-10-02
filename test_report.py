@@ -484,39 +484,69 @@ def verify_metrics(rows: list[dict], summary: dict | None, baseline: Path | None
     m["tool_calls_trigger_similarity"] = sim
 
     ordered = {}
-    for key, (label, op, threshold, threshold_text, feature) in VERIFY_METRICS.items():
+    for key, (label, _op, _threshold, threshold_text, feature) in VERIFY_METRICS.items():
         entry = m[key]
-        value = entry["value"]
-        if value is None:
-            status = "NA"
-        elif op == ">=":
-            status = "PASS" if value >= threshold - 1e-9 else "FAIL"
-        else:
-            status = "PASS" if value <= threshold + 1e-9 else "FAIL"
-        ordered[key] = {"label": label, "value": value, "threshold": threshold_text, "status": status,
-                        "feature": feature, "detail": entry["detail"]}
+        ordered[key] = {"label": label, "value": entry["value"], "threshold": threshold_text,
+                        "status": metric_status(key, entry["value"]), "feature": feature, "detail": entry["detail"]}
     return ordered
+
+
+def metric_status(key: str, value: float | None) -> str:
+    _label, op, threshold, _text, _feature = VERIFY_METRICS[key]
+    if value is None:
+        return "NA"
+    if op == ">=":
+        return "PASS" if value >= threshold - 1e-9 else "FAIL"
+    return "PASS" if value <= threshold + 1e-9 else "FAIL"
+
+
+def mean_metrics(per_loop: list[dict]) -> dict:
+    """Grade each metric on its mean over the runs (the README thresholds are pass@N means)."""
+    out = {}
+    for key, first in per_loop[0].items():
+        values = [m[key]["value"] for m in per_loop if m[key]["value"] is not None]
+        mean = sum(values) / len(values) if values else None
+        runs = ", ".join(pct(m[key]["value"], 2) for m in per_loop)
+        out[key] = {**first, "value": mean, "status": metric_status(key, mean),
+                    "detail": f"mean of {len(values)}/{len(per_loop)} runs ({runs}); run 1: {first['detail']}"}
+    return out
+
+
+def verify_loop_files(out_dir: Path) -> list[tuple[Path, Path]]:
+    """(results, summary) per verify.py run: verify_results_loopNN.jsonl for --verify-loops > 1,
+    otherwise the single verify_results.jsonl."""
+    loops = sorted(out_dir.glob("verify_results_loop*.jsonl"))
+    if not loops:
+        return [(out_dir / "verify_results.jsonl", out_dir / "verify_summary.json")]
+    return [(r, r.with_name(r.name.replace("verify_results_", "verify_summary_")).with_suffix(".json"))
+            for r in loops]
 
 
 def parse_verify(out_dir: Path, meta: dict) -> SuiteResult:
     suite = SuiteResult(name="verify")
-    results = out_dir / "verify_results.jsonl"
     run = meta.get("runs", {}).get("verify", {})
     suite.duration = run.get("wall_seconds", 0.0)
-    if not results.exists():
-        suite.collection_error = "No verify.py results produced (see verify.log)"
-        return suite
-    rows = load_jsonl(results)
-    if not rows:
-        suite.collection_error = "verify.py produced no results (see verify.log)"
-        return suite
-    summary_path = out_dir / "verify_summary.json"
-    summary = json.loads(summary_path.read_text()) if summary_path.exists() else None
     baseline = Path(meta["verify_baseline"]) if meta.get("verify_baseline") else None
     if baseline and not baseline.is_absolute():
         baseline = REPO_ROOT / baseline
-    metrics = verify_metrics(rows, summary, baseline)
-    suite.verify = {"metrics": metrics, "cases": verify_case_failures(rows), "n_cases": len(rows)}
+    loop_files = verify_loop_files(out_dir)
+    per_loop, cases, n_cases = [], [], 0
+    for i, (results, summary_path) in enumerate(loop_files, start=1):
+        rows = load_jsonl(results) if results.exists() else []
+        if not rows:
+            continue  # a run that produced nothing; reported via the loop count below
+        summary = json.loads(summary_path.read_text()) if summary_path.exists() else None
+        per_loop.append(verify_metrics(rows, summary, baseline))
+        cases += [{**c, "loop": i} for c in verify_case_failures(rows)]
+        n_cases = n_cases or len(rows)
+    if not per_loop:
+        suite.collection_error = "No verify.py results produced (see verify.log)"
+        return suite
+    metrics = per_loop[0] if len(per_loop) == 1 and len(loop_files) == 1 else mean_metrics(per_loop)
+    suite.verify = {"metrics": metrics, "cases": cases, "n_cases": n_cases,
+                    "loops": len(loop_files), "loops_with_results": len(per_loop)}
+    if len(loop_files) > 1:
+        suite.verify["per_loop"] = [{k: m["value"] for k, m in pl.items()} for pl in per_loop]
     for key, m in metrics.items():
         outcome = {"PASS": "passed", "FAIL": "failed", "NA": "skipped"}[m["status"]]
         message = (f"{m['label']} = {pct(m['value'], 2)} (threshold {m['threshold']}); {m['detail']}"
@@ -606,12 +636,25 @@ def run_suites(args: argparse.Namespace, meta: dict, out_dir: Path, workers: dic
                             break
                         dst.write(line)
                 sample = subset
-            cmd = [sys.executable, "verify.py", str(sample), "--model", args.model, "--base-url", args.base_url,
-                   "--concurrency", str(workers[suite]),
-                   "--output", str(out_dir / "verify_results.jsonl"),
-                   "--summary", str(out_dir / "verify_summary.json")]
-            if os.environ.get("M3_EXTRA_HEADERS"):
-                cmd += ["--extra-headers", os.environ["M3_EXTRA_HEADERS"]]
+            def verify_cmd(results: Path, summary: Path) -> list[str]:
+                c = [sys.executable, "verify.py", str(sample), "--model", args.model, "--base-url", args.base_url,
+                     "--concurrency", str(workers[suite]), "--output", str(results), "--summary", str(summary)]
+                if os.environ.get("M3_EXTRA_HEADERS"):
+                    c += ["--extra-headers", os.environ["M3_EXTRA_HEADERS"]]
+                return c
+
+            if args.verify_loops <= 1:
+                cmd = verify_cmd(out_dir / "verify_results.jsonl", out_dir / "verify_summary.json")
+            else:
+                # Runs one after another (same load as a single run); the suite's exit code is the
+                # last non-zero one, and every run that wrote results is graded.
+                runs = [shlex.join(verify_cmd(out_dir / f"verify_results_loop{i:02d}.jsonl",
+                                              out_dir / f"verify_summary_loop{i:02d}.json"))
+                        for i in range(1, args.verify_loops + 1)]
+                script = "rc=0\n" + "".join(
+                    f'echo "=== verify.py run {i}/{len(runs)}"\n{r} || rc=$?\n' for i, r in enumerate(runs, start=1)
+                ) + "exit $rc\n"
+                cmd = ["bash", "-c", script]
             env, cwd = {**base_env, "OPENAI_API_KEY": api_key, "PYTHONUNBUFFERED": "1"}, REPO_ROOT
         else:
             xdist = ["-n", str(workers[suite])] if workers[suite] > 1 else []
@@ -624,7 +667,7 @@ def run_suites(args: argparse.Namespace, meta: dict, out_dir: Path, workers: dic
                    "M3_STREAM_STATS_LOG": str(log_dir / f"{suite}_stream_stats.jsonl")}
             cwd = PYTEST_DIR
         log = (out_dir / f"{suite}.log").open("w")
-        shown = redacted_cmd(cmd[1:], secrets)
+        shown = redacted_cmd(cmd[1:] if cmd[0] == sys.executable else cmd, secrets)
         print(f"[run] {suite} (workers={workers[suite]}): {shown}", flush=True)
         proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
         procs[suite] = (shown, proc, log, time.monotonic())
@@ -769,7 +812,8 @@ def render_verify(lines: list[str], s: SuiteResult, unsupported: list[str]) -> N
         f"Graded metrics: **{s.count('passed')}/{s.executed} passed**"
         + (f", {s.waived} waived" if s.waived else "")
         + (f", {s.count('skipped')} not computable" if s.count("skipped") else "")
-        + f" ({v['n_cases']} cases in the sample set)",
+        + f" ({v['n_cases']} cases in the sample set"
+        + (f", mean of {v['loops_with_results']}/{v['loops']} runs" if v.get("loops", 1) > 1 else "") + ")",
         "",
         "| Metric | Value | Threshold | Status | Detail |",
         "|:-------|------:|:----------|:-------|:-------|",
@@ -807,11 +851,11 @@ def render_verify(lines: list[str], s: SuiteResult, unsupported: list[str]) -> N
         "",
         f"<details><summary>Failing cases ({len(cases)})</summary>",
         "",
-        "| Case (sample.jsonl line) | expected_tool_call | finish_reason | Cause | Detail |",
-        "|:-------------------------|:-------------------|:--------------|:------|:-------|",
+        "| Case (sample.jsonl line) | Run | expected_tool_call | finish_reason | Cause | Detail |",
+        "|:-------------------------|----:|:-------------------|:--------------|:------|:-------|",
     ]
-    for c in sorted(cases, key=lambda c: (c["case"] or 0)):
-        lines.append(f"| `#{c['case']}` | {c['expected_tool_call']} | {c['finish_reason']} "
+    for c in sorted(cases, key=lambda c: (c["case"] or 0, c.get("loop", 1))):
+        lines.append(f"| `#{c['case']}` | {c.get('loop', 1)} | {c['expected_tool_call']} | {c['finish_reason']} "
                      f"| {md_escape(c['cause'])} | {md_escape(c['detail'])} |")
     lines += ["", "</details>"]
 
@@ -1085,6 +1129,9 @@ def main() -> int:
                              "always, or never")
     parser.add_argument("--verify-sample", default=str(DEFAULT_SAMPLE), help="verify.py test set")
     parser.add_argument("--verify-limit", type=int, default=0, help="Only run the first N verify.py cases")
+    parser.add_argument("--verify-loops", type=int, default=1,
+                        help="Run verify.py N times, one after another, and grade the mean of the metrics "
+                             "(the README thresholds are pass@N means; default: 1)")
     parser.add_argument("--verify-results", metavar="RESULTS_JSONL",
                         help="Grade an existing verify.py results file instead of running verify.py")
     parser.add_argument("--verify-baseline", default=None,
@@ -1135,6 +1182,7 @@ def main() -> int:
             "pytest_args": args.pytest_args or None,
             "verify_sample": args.verify_sample,
             "verify_limit": args.verify_limit or None,
+            "verify_loops": args.verify_loops,
             "verify_baseline": (str(baseline.relative_to(REPO_ROOT)) if baseline and baseline.is_relative_to(REPO_ROOT)
                                 else (str(baseline) if baseline else None)),
             "run_command": redacted_cmd(["python", "test_report.py", *sys.argv[1:]], secrets),

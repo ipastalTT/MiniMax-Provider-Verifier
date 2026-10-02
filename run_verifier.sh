@@ -27,6 +27,7 @@
 #   REASONING_EFFORT_WORKERS
 #   VERIFY_CONCURRENCY      verify.py --concurrency                  (default: 16)
 #   VERIFY_LIMIT            Only run the first N sample.jsonl cases  (default: all)
+#   VERIFY_LOOPS            Run verify.py N times in a row and grade the mean (pass@N) (default: 1)
 #   INCLUDE_SLOW            1 to also run pytest cases marked slow   (default: off, -m "not slow")
 #   M3_EXTRA_HEADERS        Optional JSON object of extra request headers (both harnesses)
 #   REPORT_DIR              Where run directories are created       (default: <repo>/reports)
@@ -69,6 +70,7 @@ STREAM_WORKERS="${STREAM_WORKERS:-16}"
 REASONING_EFFORT_WORKERS="${REASONING_EFFORT_WORKERS:-16}"
 VERIFY_CONCURRENCY="${VERIFY_CONCURRENCY:-16}"
 VERIFY_LIMIT="${VERIFY_LIMIT:-0}"
+VERIFY_LOOPS="${VERIFY_LOOPS:-1}"
 INCLUDE_SLOW="${INCLUDE_SLOW:-0}"
 REPORT_DIR="${REPORT_DIR:-$REPO_DIR/reports}"
 
@@ -100,6 +102,7 @@ args=(
     --auth-type "$auth_type"
     --output-dir "$REPORT_DIR"
     --verify-limit "$VERIFY_LIMIT"
+    --verify-loops "$VERIFY_LOOPS"
     --workers
         "text=$TEXT_WORKERS"
         "image=$IMAGE_WORKERS"
