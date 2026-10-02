@@ -18,17 +18,19 @@
 #   MODEL_NAME              Model id as served by the provider (required)
 #   PROVIDER                Provider name for the report title      (default: vendor)
 #   UNSUPPORTED             Space-separated features to waive, e.g. "video vision"
-#   SUITES                  Space-separated suites to run
-#                           (default: text image video stream reasoning_effort verify)
-#   TEXT_WORKERS            pytest-xdist workers per suite           (default: 16 each)
+#   SUITES                  Space-separated suites to run            (default: text stream verify;
+#                           also available: image video reasoning_effort)
+#   TEXT_WORKERS            pytest-xdist workers per suite           (default: 20 each)
 #   IMAGE_WORKERS
 #   VIDEO_WORKERS
 #   STREAM_WORKERS
 #   REASONING_EFFORT_WORKERS
-#   VERIFY_CONCURRENCY      verify.py --concurrency                  (default: 16)
+#   VERIFY_CONCURRENCY      verify.py --concurrency                  (default: 20)
 #   VERIFY_LIMIT            Only run the first N sample.jsonl cases  (default: all)
 #   VERIFY_LOOPS            Run verify.py N times in a row and grade the mean (pass@N) (default: 1)
-#   INCLUDE_SLOW            1 to also run pytest cases marked slow   (default: off, -m "not slow")
+#   INCLUDE_SLOW            0 to skip the pytest cases marked slow   (default: 1, run them)
+#   RUN_ORDER               sequential: verify.py first, then the pytest suites (default);
+#                           parallel: everything at once
 #   M3_EXTRA_HEADERS        Optional JSON object of extra request headers (both harnesses)
 #   REPORT_DIR              Where run directories are created       (default: <repo>/reports)
 #
@@ -62,16 +64,17 @@ fi
 : "${MODEL_NAME:?MODEL_NAME is required}"
 PROVIDER="${PROVIDER:-vendor}"
 UNSUPPORTED="${UNSUPPORTED:-}"
-SUITES="${SUITES:-text image video stream reasoning_effort verify}"
-TEXT_WORKERS="${TEXT_WORKERS:-16}"
-IMAGE_WORKERS="${IMAGE_WORKERS:-16}"
-VIDEO_WORKERS="${VIDEO_WORKERS:-16}"
-STREAM_WORKERS="${STREAM_WORKERS:-16}"
-REASONING_EFFORT_WORKERS="${REASONING_EFFORT_WORKERS:-16}"
-VERIFY_CONCURRENCY="${VERIFY_CONCURRENCY:-16}"
+SUITES="${SUITES:-text stream verify}"
+TEXT_WORKERS="${TEXT_WORKERS:-20}"
+IMAGE_WORKERS="${IMAGE_WORKERS:-20}"
+VIDEO_WORKERS="${VIDEO_WORKERS:-20}"
+STREAM_WORKERS="${STREAM_WORKERS:-20}"
+REASONING_EFFORT_WORKERS="${REASONING_EFFORT_WORKERS:-20}"
+VERIFY_CONCURRENCY="${VERIFY_CONCURRENCY:-20}"
 VERIFY_LIMIT="${VERIFY_LIMIT:-0}"
 VERIFY_LOOPS="${VERIFY_LOOPS:-1}"
-INCLUDE_SLOW="${INCLUDE_SLOW:-0}"
+INCLUDE_SLOW="${INCLUDE_SLOW:-1}"
+RUN_ORDER="${RUN_ORDER:-sequential}"
 REPORT_DIR="${REPORT_DIR:-$REPO_DIR/reports}"
 
 if [[ -z "${MINIMAX_API_KEY:-}" && -n "${OPENAI_API_KEY:-}" ]]; then
@@ -103,6 +106,7 @@ args=(
     --output-dir "$REPORT_DIR"
     --verify-limit "$VERIFY_LIMIT"
     --verify-loops "$VERIFY_LOOPS"
+    --order "$RUN_ORDER"
     --workers
         "text=$TEXT_WORKERS"
         "image=$IMAGE_WORKERS"
@@ -119,6 +123,7 @@ if [[ -n "$UNSUPPORTED" ]]; then
 fi
 case "$(printf %s "$INCLUDE_SLOW" | tr "[:upper:]" "[:lower:]")" in
     1|true|yes|on) args+=(--include-slow) ;;
+    *)             args+=(--no-include-slow) ;;
 esac
 
 cd "$REPO_DIR"

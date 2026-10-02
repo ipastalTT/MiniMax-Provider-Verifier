@@ -62,6 +62,10 @@ SUITES = {
     "verify": (None, "verify.py on sample.jsonl: tool-call trigger / schema metrics vs. reference thresholds"),
 }
 PYTEST_SUITES = [s for s, (f, _) in SUITES.items() if f]
+# Default run: the tool-call metrics plus the text and stream format checks, slow cases
+# included, 20-way, verify.py first and the format checks after it.
+DEFAULT_SUITES = ["text", "stream", "verify"]
+DEFAULT_WORKERS = "20"
 
 # Suites that only apply to some models: suite -> pattern the model name must match.
 # m3_a_reasoning_effort_tests.py belongs to the M3-a (M3.1) case family: it asserts that
@@ -622,7 +626,7 @@ def run_suites(args: argparse.Namespace, meta: dict, out_dir: Path, workers: dic
         "M3_AUTH_TYPE": meta["auth_type"],
         "M3_MODEL": args.model,
     }
-    procs = {}
+    specs = []
     for suite in args.suites:
         if suite == "verify":
             if args.verify_results:
@@ -666,19 +670,28 @@ def run_suites(args: argparse.Namespace, meta: dict, out_dir: Path, workers: dic
                    "M3_RUN_LOG": str(log_dir / f"{suite}.jsonl"),
                    "M3_STREAM_STATS_LOG": str(log_dir / f"{suite}_stream_stats.jsonl")}
             cwd = PYTEST_DIR
-        log = (out_dir / f"{suite}.log").open("w")
-        shown = redacted_cmd(cmd[1:] if cmd[0] == sys.executable else cmd, secrets)
-        print(f"[run] {suite} (workers={workers[suite]}): {shown}", flush=True)
-        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
-        procs[suite] = (shown, proc, log, time.monotonic())
+        specs.append((suite, cmd, env, cwd))
 
+    # sequential: verify.py first, then the pytest suites together; parallel: one phase.
+    if args.order == "sequential":
+        phases = [[s for s in specs if s[0] == "verify"], [s for s in specs if s[0] != "verify"]]
+    else:
+        phases = [specs]
     runs = {}
-    for suite, (shown, proc, log, start) in procs.items():
-        code = proc.wait()
-        log.close()
-        elapsed = round(time.monotonic() - start, 1)
-        print(f"[done] {suite}: exit code {code} after {elapsed:.0f}s", flush=True)
-        runs[suite] = {"exit_code": code, "workers": workers[suite], "wall_seconds": elapsed, "command": shown}
+    for phase in (p for p in phases if p):
+        procs = {}
+        for suite, cmd, env, cwd in phase:
+            log = (out_dir / f"{suite}.log").open("w")
+            shown = redacted_cmd(cmd[1:] if cmd[0] == sys.executable else cmd, secrets)
+            print(f"[run] {suite} (workers={workers[suite]}): {shown}", flush=True)
+            proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
+            procs[suite] = (shown, proc, log, time.monotonic())
+        for suite, (shown, proc, log, start) in procs.items():
+            code = proc.wait()
+            log.close()
+            elapsed = round(time.monotonic() - start, 1)
+            print(f"[done] {suite}: exit code {code} after {elapsed:.0f}s", flush=True)
+            runs[suite] = {"exit_code": code, "workers": workers[suite], "wall_seconds": elapsed, "command": shown}
     return runs
 
 
@@ -1113,8 +1126,9 @@ def main() -> int:
                         help="OpenAI-compatible base URL including /v1 (M3_BASE_URL is derived by stripping /v1)")
     parser.add_argument("--model", default=os.environ.get("MODEL_NAME", ""))
     parser.add_argument("--provider", default="vendor", help="Provider name shown in the report title")
-    parser.add_argument("--suites", nargs="+", choices=list(SUITES), default=list(SUITES))
-    parser.add_argument("--workers", nargs="+", default=["1"], metavar="N|SUITE=N",
+    parser.add_argument("--suites", nargs="+", choices=list(SUITES), default=DEFAULT_SUITES,
+                        help=f"Suites to run (default: {' '.join(DEFAULT_SUITES)}; all: {' '.join(SUITES)})")
+    parser.add_argument("--workers", nargs="+", default=[DEFAULT_WORKERS], metavar="N|SUITE=N",
                         help="pytest-xdist workers (verify: concurrency): one number for every suite, "
                              "and/or SUITE=N overrides")
     parser.add_argument("--unsupported", nargs="*", choices=list(FEATURES), default=None,
@@ -1122,7 +1136,13 @@ def main() -> int:
     parser.add_argument("--auth-type", choices=["auto", "bearer", "none"], default="auto",
                         help="bearer: send the API key; none: no Authorization header in the pytest suites "
                              "(auto: bearer if an API key is set, else none)")
-    parser.add_argument("--include-slow", action="store_true", help="Also run pytest cases marked slow")
+    parser.add_argument("--include-slow", action=argparse.BooleanOptionalAction, default=True,
+                        help="Run the pytest cases marked slow (512k/1M-token prompts, long videos); "
+                             "--no-include-slow deselects them (default: included)")
+    parser.add_argument("--order", choices=["sequential", "parallel"], default="sequential",
+                        help="sequential: verify.py first, then the pytest suites (in parallel with each "
+                             "other), so long prompts do not slow the tool-call runs; parallel: everything "
+                             "at once (default: sequential)")
     parser.add_argument("--pytest-args", default="", help='Extra arguments for every pytest suite, e.g. --pytest-args="-k basic" (use the = form)')
     parser.add_argument("--grade-model-scoped", choices=["auto", "always", "never"], default="auto",
                         help="Grade model-scoped suites (reasoning_effort) only for matching models (auto), "
@@ -1179,6 +1199,7 @@ def main() -> int:
             "unsupported": args.unsupported or [],
             "auth_type": auth_type,
             "include_slow": args.include_slow,
+            "order": args.order,
             "pytest_args": args.pytest_args or None,
             "verify_sample": args.verify_sample,
             "verify_limit": args.verify_limit or None,

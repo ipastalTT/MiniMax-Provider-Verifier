@@ -207,7 +207,7 @@ bash run_batch_sequential.sh \
 
 ### 并行测试与报告（`run_verifier.sh`）
 
-`run_verifier.sh` 并行运行 `m3_format_check/` 中的 pytest 格式校验套件（`text`、`image`、`video`、`stream`、`reasoning_effort`）以及一次 `sample.jsonl` 上的 `verify.py`（`verify`），然后通过 `test_report.py` 生成 Markdown 通过率报告。可在任意目录调用（例如在其他仓库的 CI 中）：
+`run_verifier.sh` 先在 `sample.jsonl` 上运行一次 `verify.py`（`verify`），再运行 `m3_format_check/` 中的 pytest 格式校验套件。默认是 `text` 和 `stream`（包含 512k/1M token 的 slow 用例），每个套件 20 个 worker，`verify.py` 并发 20；`image`、`video`、`reasoning_effort` 可通过 `SUITES` 加入。然后通过 `test_report.py` 生成 Markdown 通过率报告。可在任意目录调用（例如在其他仓库的 CI 中）：
 
 ```bash
 MINIMAX_API_KEY=sk-... \
@@ -217,7 +217,7 @@ PROVIDER=Tenstorrent UNSUPPORTED="video" \
 /path/to/MiniMax-Provider-Verifier/run_verifier.sh
 ```
 
-- 配置均为环境变量（未设置的从 `<repo>/.env` 读取）：`MINIMAX_API_KEY`（回退到 `OPENAI_API_KEY`）、`MINIMAX_BASE_URL`（OpenAI 兼容地址，包含 `/v1`；pytest 套件使用去掉 `/v1` 的地址）、`MODEL_NAME`、`PROVIDER`、`UNSUPPORTED`、`SUITES`、`TEXT_WORKERS` / `IMAGE_WORKERS` / `VIDEO_WORKERS` / `STREAM_WORKERS` / `REASONING_EFFORT_WORKERS`（pytest-xdist worker 数，默认 16）、`VERIFY_CONCURRENCY`（默认 16）、`VERIFY_LIMIT`（只跑前 N 个样本）、`VERIFY_LOOPS`（连续运行 `verify.py` N 次，按各指标均值评分，即与 README 阈值一致的 pass@N；默认 1）、`INCLUDE_SLOW=1`（同时运行 `slow` 用例）、`M3_EXTRA_HEADERS`、`REPORT_DIR`（默认 `<repo>/reports`）。额外参数会传给 `test_report.py`，例如 `--pytest-args="-k TestSSEStream"`。
+- 配置均为环境变量（未设置的从 `<repo>/.env` 读取）：`MINIMAX_API_KEY`（回退到 `OPENAI_API_KEY`）、`MINIMAX_BASE_URL`（OpenAI 兼容地址，包含 `/v1`；pytest 套件使用去掉 `/v1` 的地址）、`MODEL_NAME`、`PROVIDER`、`UNSUPPORTED`、`SUITES`（默认 `text stream verify`）、`TEXT_WORKERS` / `IMAGE_WORKERS` / `VIDEO_WORKERS` / `STREAM_WORKERS` / `REASONING_EFFORT_WORKERS`（pytest-xdist worker 数，默认 20）、`VERIFY_CONCURRENCY`（默认 20）、`VERIFY_LIMIT`（只跑前 N 个样本）、`VERIFY_LOOPS`（连续运行 `verify.py` N 次，按各指标均值评分，即与 README 阈值一致的 pass@N；默认 1）、`INCLUDE_SLOW`（默认 1；设为 0 跳过 `slow` 用例）、`RUN_ORDER`（默认 `sequential`：先运行 `verify.py` 再运行 pytest 套件，避免长 prompt 拖慢 tool-call 测试；`parallel`：全部同时运行）、`M3_EXTRA_HEADERS`、`REPORT_DIR`（默认 `<repo>/reports`）。额外参数会传给 `test_report.py`，例如 `--pytest-args="-k TestSSEStream"`。
 - 未设置 API key 时按无鉴权方式测试（`M3_AUTH_TYPE=none`），两个 401 用例会被豁免。
 - 依赖由 `uv` 根据 `requirements.txt` 和 `m3_format_check/requirements.txt` 从 PyPI 安装到缓存环境（可用 `UV_DEFAULT_INDEX` 覆盖）。不使用 `pyproject.toml` / `uv.lock`，因为它们固定了镜像源，且不包含 pytest 依赖。
 - 每次运行生成 `REPORT_DIR/<provider>_<model>_<timestamp>/`，包含 `report_<id>.md`、`summary.json`、`verifier_results_<id>.json`（沿用 tt-inference-server 报告结构 `metadata` / `sections` / `acceptance_*`，包含每个用例的结果及完整的失败信息和 traceback，以及 verify 指标和逐用例失败）、`run_meta.json`，每个 pytest 套件一份 JUnit XML 和控制台日志，`verify_results.jsonl` / `verify_summary.json` / `verify.log`，以及 `logs/` 下的逐请求日志。目录内所有文件都会脱敏 API key。
